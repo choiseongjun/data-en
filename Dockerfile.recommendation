@@ -1,0 +1,12 @@
+FROM python:3.9-slim
+
+WORKDIR /app
+
+# 필수 패키지 설치
+RUN pip install redis kafka-python
+
+# 스크립트 복사
+COPY simple_recommendation_generator.py .
+
+# 실행
+CMD ["python", "simple_recommendation_generator.py"]
