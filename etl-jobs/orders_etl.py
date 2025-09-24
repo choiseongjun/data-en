@@ -28,13 +28,42 @@ class OrdersETL:
         # 마지막 ETL 실행 시간 추적
         self.last_etl_time = None
 
+    def close_connection(self):
+        """PostgreSQL 연결 정리"""
+        if self.pg_conn is not None:
+            try:
+                if self.pg_conn.closed == 0:
+                    self.pg_conn.close()
+                logger.info("PostgreSQL connection closed")
+            except Exception as e:
+                logger.error(f"Error closing connection: {e}")
+            finally:
+                self.pg_conn = None
+
     def get_connection(self):
         """PostgreSQL 연결 관리 (재연결 지원)"""
         try:
-            if self.pg_conn is None or self.pg_conn.closed:
+            # 연결이 없거나 닫혔다면 새로 생성
+            if self.pg_conn is None or self.pg_conn.closed != 0:
+                if self.pg_conn is not None:
+                    try:
+                        self.pg_conn.close()
+                    except:
+                        pass
                 logger.info("Creating new PostgreSQL connection")
                 self.pg_conn = psycopg2.connect(**self.pg_config)
-            return self.pg_conn
+                self.pg_conn.autocommit = True  # 자동 커밋 설정
+
+            # 연결 상태 확인
+            try:
+                with self.pg_conn.cursor() as cur:
+                    cur.execute('SELECT 1')
+                return self.pg_conn
+            except (psycopg2.OperationalError, psycopg2.InterfaceError):
+                logger.warning("Connection test failed, creating new connection")
+                self.pg_conn = None
+                return self.get_connection()  # 재귀 호출로 새 연결 생성
+
         except Exception as e:
             logger.error(f"Failed to connect to PostgreSQL: {e}")
             self.pg_conn = None
@@ -44,59 +73,68 @@ class OrdersETL:
         """PostgreSQL에서 주문 데이터 추출 (증분 업데이트 지원)"""
         conn = self.get_connection()
 
-        with conn.cursor() as cursor:
-            # 증분 업데이트: 마지막 ETL 이후 생성/수정된 주문만 가져오기
-            where_clause = ""
-            params = []
+        try:
+            with conn.cursor() as cursor:
+                # 증분 업데이트: 마지막 ETL 이후 생성/수정된 주문만 가져오기
+                where_clause = ""
+                params = []
 
-            if self.last_etl_time:
-                where_clause = "WHERE o.created_at > %s OR o.updated_at > %s"
-                params = [self.last_etl_time, self.last_etl_time]
-                logger.info(f"Extracting orders modified after {self.last_etl_time}")
-            else:
-                logger.info("Extracting all orders (initial run)")
+                if self.last_etl_time:
+                    where_clause = "WHERE o.created_at > %s OR o.updated_at > %s"
+                    params = [self.last_etl_time, self.last_etl_time]
+                    logger.info(f"Extracting orders modified after {self.last_etl_time}")
+                else:
+                    logger.info("Extracting all orders (initial run)")
 
-            query = f"""
-                SELECT
-                    o.order_id,
-                    o.user_id,
-                    u.name as user_name,
-                    u.email as user_email,
-                    o.order_date,
-                    o.status,
-                    o.total_amount,
-                    o.shipping_address,
-                    o.payment_method,
-                    o.created_at,
-                    o.updated_at,
-                    -- 주문 아이템 정보를 JSON으로 집계
-                    json_agg(
-                        json_build_object(
-                            'product_id', oi.product_id,
-                            'product_name', p.name,
-                            'category', c.name,
-                            'brand', b.name,
-                            'quantity', oi.quantity,
-                            'unit_price', oi.unit_price,
-                            'total_price', oi.total_price
-                        )
-                    ) as items
-                FROM orders o
-                JOIN users u ON o.user_id = u.user_id
-                JOIN order_items oi ON o.order_id = oi.order_id
-                JOIN products p ON oi.product_id = p.product_id
-                JOIN categories c ON p.category_id = c.category_id
-                JOIN brands b ON p.brand_id = b.brand_id
-                {where_clause}
-                GROUP BY o.order_id, u.name, u.email
-                ORDER BY o.order_date DESC
-                LIMIT 10000
-            """
+                query = f"""
+                    SELECT
+                        o.order_id,
+                        o.user_id,
+                        u.name as user_name,
+                        u.email as user_email,
+                        o.order_date,
+                        o.status,
+                        o.total_amount,
+                        o.shipping_address,
+                        o.payment_method,
+                        o.created_at,
+                        o.updated_at,
+                        -- 주문 아이템 정보를 JSON으로 집계
+                        json_agg(
+                            json_build_object(
+                                'product_id', oi.product_id,
+                                'product_name', p.name,
+                                'category', c.name,
+                                'brand', b.name,
+                                'quantity', oi.quantity,
+                                'unit_price', oi.unit_price,
+                                'total_price', oi.total_price
+                            )
+                        ) as items
+                    FROM orders o
+                    JOIN users u ON o.user_id = u.user_id
+                    JOIN order_items oi ON o.order_id = oi.order_id
+                    JOIN products p ON oi.product_id = p.product_id
+                    JOIN categories c ON p.category_id = c.category_id
+                    JOIN brands b ON p.brand_id = b.brand_id
+                    {where_clause}
+                    GROUP BY o.order_id, u.name, u.email
+                    ORDER BY o.order_date DESC
+                    LIMIT 10000
+                """
 
-            cursor.execute(query, params)
-            orders = cursor.fetchall()
-            logger.info(f"Extracted {len(orders)} orders from PostgreSQL")
-            return orders
+                cursor.execute(query, params)
+                orders = cursor.fetchall()
+                logger.info(f"Extracted {len(orders)} orders from PostgreSQL")
+                return orders
+
+        except Exception as e:
+            logger.error(f"Error extracting orders: {e}")
+            # 연결 에러 시 다음 시도를 위해 연결 재설정
+            if any(keyword in str(e).lower() for keyword in ['connection', 'server', 'network']):
+                logger.info("Resetting connection due to connection error")
+                self.pg_conn = None
+            raise
 
     def transform_orders(self, orders):
         """주문 데이터 변환"""
@@ -247,10 +285,10 @@ class OrdersETL:
 
         except Exception as e:
             logger.error(f"ETL process failed: {e}")
-            # 연결 문제 시 재연결을 위해 None으로 설정
-            if "connection" in str(e).lower():
-                logger.info("Resetting connection for next attempt")
-                self.pg_conn = None
+            # 연결 문제 시 재연결을 위해 연결 정리
+            if any(keyword in str(e).lower() for keyword in ['connection', 'server', 'network']):
+                logger.info("Closing connection due to connection error")
+                self.close_connection()
 
 if __name__ == "__main__":
     # 주기적으로 ETL 실행 (2분마다)
@@ -264,8 +302,7 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             logger.info("ETL process stopped")
             # 연결 정리
-            if etl.pg_conn and not etl.pg_conn.closed:
-                etl.pg_conn.close()
+            etl.close_connection()
             break
         except Exception as e:
             logger.error(f"Unexpected error: {e}")
