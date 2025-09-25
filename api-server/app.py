@@ -6,6 +6,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from elasticsearch import Elasticsearch
 from datetime import datetime
+import functools
 
 # DB 튜닝 기능을 직접 추가
 import time
@@ -23,14 +24,86 @@ redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
 es = Elasticsearch(['http://elasticsearch:9200'])
 
 # PostgreSQL 연결
+# 쿼리 로깅을 위한 커서 래퍼 클래스
+class LoggingCursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def execute(self, query, params=None):
+        start_time = time.time()
+        try:
+            # 쿼리와 파라미터 로깅
+            if params:
+                logger.info(f"[SQL Query] {query}")
+                logger.info(f"[SQL Params] {params}")
+                print(f"[SQL Query] {query}", flush=True)
+                print(f"[SQL Params] {params}", flush=True)
+            else:
+                logger.info(f"[SQL Query] {query}")
+                print(f"[SQL Query] {query}", flush=True)
+
+            result = self._cursor.execute(query, params)
+
+            # 실행 시간 로깅
+            execution_time = (time.time() - start_time) * 1000
+            logger.info(f"[SQL Execution Time] {execution_time:.2f}ms")
+            print(f"[SQL Execution Time] {execution_time:.2f}ms", flush=True)
+
+            return result
+        except Exception as e:
+            execution_time = (time.time() - start_time) * 1000
+            logger.error(f"[SQL Error] {str(e)} (took {execution_time:.2f}ms)")
+            print(f"[SQL Error] {str(e)} (took {execution_time:.2f}ms)", flush=True)
+            raise
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchmany(self, size=None):
+        return self._cursor.fetchmany(size)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if hasattr(self._cursor, '__exit__'):
+            return self._cursor.__exit__(exc_type, exc_val, exc_tb)
+        return False
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+# 로깅이 적용된 연결 클래스
+class LoggingConnection:
+    def __init__(self, connection):
+        self._connection = connection
+
+    def cursor(self):
+        return LoggingCursor(self._connection.cursor())
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if hasattr(self._connection, '__exit__'):
+            return self._connection.__exit__(exc_type, exc_val, exc_tb)
+        return False
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
 def get_db_connection():
-    return psycopg2.connect(
+    conn = psycopg2.connect(
         host='postgres',
         database='ecommerce',
         user='postgres',
         password='postgres',
         cursor_factory=RealDictCursor
     )
+    return LoggingConnection(conn)
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -1292,7 +1365,7 @@ def product_stats_covering_index():
 
                 # 1. 일반적인 방식 (테이블 스캔 포함)
                 start_time = time.time()
-                cursor.execute(f"""
+                query1 = f"""
                     SELECT p.product_id, p.name, c.name as category,
                            COUNT(oi.order_item_id) as times_ordered,
                            SUM(oi.quantity) as total_quantity_sold,
@@ -1309,7 +1382,8 @@ def product_stats_covering_index():
                     GROUP BY p.product_id, p.name, c.name, p.rating, p.stock_quantity
                     ORDER BY total_revenue DESC NULLS LAST
                     LIMIT 100
-                """, params)
+                """
+                cursor.execute(query1, params)
                 without_results = cursor.fetchall()
                 without_time = time.time() - start_time
 
@@ -1319,26 +1393,29 @@ def product_stats_covering_index():
                 }
 
                 # 2. 커버링 인덱스 생성
-                cursor.execute("""
+                index1_sql = """
                     CREATE INDEX IF NOT EXISTS idx_order_items_covering
                     ON order_items(product_id)
                     INCLUDE (order_id, quantity, unit_price, total_price)
-                """)
+                """
+                cursor.execute(index1_sql)
 
-                cursor.execute("""
+                index2_sql = """
                     CREATE INDEX IF NOT EXISTS idx_products_covering
                     ON products(product_id, is_active, category_id)
                     INCLUDE (name, rating, stock_quantity)
-                """)
+                """
+                cursor.execute(index2_sql)
 
-                cursor.execute("""
+                index3_sql = """
                     CREATE INDEX IF NOT EXISTS idx_orders_covering_status
                     ON orders(order_id, status)
-                """)
+                """
+                cursor.execute(index3_sql)
 
                 # 3. 커버링 인덱스를 활용한 쿼리
                 start_time = time.time()
-                cursor.execute(f"""
+                query2 = f"""
                     SELECT p.product_id, p.name, c.name as category,
                            COUNT(oi.order_item_id) as times_ordered,
                            SUM(oi.quantity) as total_quantity_sold,
@@ -1355,7 +1432,8 @@ def product_stats_covering_index():
                     GROUP BY p.product_id, p.name, c.name, p.rating, p.stock_quantity
                     ORDER BY total_revenue DESC NULLS LAST
                     LIMIT 100
-                """, params)
+                """
+                cursor.execute(query2, params)
                 with_results = cursor.fetchall()
                 with_time = time.time() - start_time
 
