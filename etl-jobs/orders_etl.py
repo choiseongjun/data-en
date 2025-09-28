@@ -118,7 +118,7 @@ class OrdersETL:
                     JOIN categories c ON p.category_id = c.category_id
                     JOIN brands b ON p.brand_id = b.brand_id
                     {where_clause}
-                    GROUP BY o.order_id, u.name, u.email
+                    GROUP BY o.order_id, o.user_id, u.name, u.email, o.order_date, o.status, o.total_amount, o.shipping_address, o.payment_method, o.created_at, o.updated_at
                     ORDER BY o.order_date DESC
                     LIMIT 10000
                 """

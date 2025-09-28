@@ -119,6 +119,76 @@ curl http://localhost:5000/user-stats/user_000001
 curl http://localhost:5000/popular-products?limit=20
 ```
 
+### 6. DB 튜닝 및 쿼리 최적화 (120만 건 대용량 데이터)
+
+#### 6.1 대용량 데이터 실제 성능 튜닝 예시
+
+##### 6.1.1 느린 쿼리 vs 최적화된 쿼리 비교
+```bash
+# WHERE절에서 함수 사용 vs 날짜 범위 사용 비교
+curl "http://localhost:5000/db-tuning/heavy-queries"
+```
+
+##### 6.1.2 대용량 테이블 페이징 최적화
+```bash
+# OFFSET vs Cursor 기반 페이징 성능 비교 (깊은 페이지)
+curl "http://localhost:5000/db-tuning/pagination-performance?page=10000&limit=20"
+```
+
+##### 6.1.3 대용량 데이터 집계 쿼리 최적화
+```bash
+# 복합 인덱스 활용한 집계 성능 개선
+curl "http://localhost:5000/db-tuning/aggregation-optimization"
+```
+
+##### 6.1.4 대용량 테이블 JOIN 최적화
+```bash
+# 서브쿼리 사전 필터링을 통한 JOIN 성능 개선
+curl "http://localhost:5000/db-tuning/join-performance"
+```
+
+#### 6.2 Full Table Scan vs Index Scan 성능 비교
+```bash
+curl "http://localhost:5000/db-tuning/scan-comparison?table=orders&limit=100"
+```
+
+#### 6.3 인덱스 힌트 실험
+```bash
+# 기본 쿼리 vs 강제 인덱스 스캔 성능 비교
+curl -X POST "http://localhost:5000/db-tuning/index-hints-simple" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "SELECT order_id, status FROM orders LIMIT 50"}'
+```
+
+#### 6.4 복잡한 쿼리 최적화 실험
+```bash
+# JOIN 최적화 비교 (Nested Loop, Hash Join, Merge Join)
+curl -X POST "http://localhost:5000/db-tuning/query-optimization" \
+  -H "Content-Type: application/json" \
+  -d '{"type": "join_optimization"}'
+
+# 서브쿼리 최적화 실험
+curl -X POST "http://localhost:5000/db-tuning/query-optimization" \
+  -H "Content-Type: application/json" \
+  -d '{"type": "subquery_optimization"}'
+```
+
+#### 6.5 쿼리 실행 계획 분석
+```bash
+curl -X POST "http://localhost:5000/db-tuning/query-plan" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "SELECT o.*, u.name FROM orders o JOIN users u ON o.user_id = u.user_id LIMIT 10"}'
+```
+
+#### 6.6 테이블 통계 및 인덱스 분석
+```bash
+# 테이블 통계 조회
+curl "http://localhost:5000/db-tuning/table-stats"
+
+# 인덱스 사용률 분석
+curl "http://localhost:5000/db-tuning/index-analysis"
+```
+
 ## 🔍 모니터링
 
 ### Kafka 모니터링

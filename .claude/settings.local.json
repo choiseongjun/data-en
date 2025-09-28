@@ -6,7 +6,17 @@
       "Bash(docker-compose up:*)",
       "Bash(docker exec:*)",
       "Bash(docker-compose:*)",
-      "Bash(docker logs:*)"
+      "Bash(docker logs:*)",
+      "Bash(curl:*)",
+      "Bash(docker stop:*)",
+      "Bash(docker rm:*)",
+      "Bash(docker build:*)",
+      "Bash(docker run:*)",
+      "Bash(docker restart:*)",
+      "Bash(python:*)",
+      "Bash(timeout 15 docker exec postgres psql -U postgres -d ecommerce -c \"SELECT schemaname, tablename, indexname FROM pg_indexes WHERE tablename = ''orders'';\")",
+      "Bash(git add:*)",
+      "Bash(mkdir:*)"
     ],
     "deny": [],
     "ask": []

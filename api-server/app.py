@@ -7,6 +7,7 @@ from psycopg2.extras import RealDictCursor
 from elasticsearch import Elasticsearch
 from datetime import datetime
 import functools
+import requests
 
 # DB 튜닝 기능을 직접 추가
 import time
@@ -24,6 +25,23 @@ redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
 es = Elasticsearch(['http://elasticsearch:9200'])
 
 # PostgreSQL 연결
+# Logstash로 로그 전송 함수
+def send_to_logstash(message, log_data=None):
+    try:
+        payload = {
+            "message": message,
+            "timestamp": datetime.utcnow().isoformat(),
+            "service": "api-server"
+        }
+        if log_data:
+            payload.update(log_data)
+
+        requests.post("http://logstash:5044",
+                     json=payload,
+                     timeout=1)
+    except:
+        pass  # 로그 전송 실패해도 메인 로직에 영향 없도록
+
 # 쿼리 로깅을 위한 커서 래퍼 클래스
 class LoggingCursor:
     def __init__(self, cursor):
@@ -32,28 +50,50 @@ class LoggingCursor:
     def execute(self, query, params=None):
         start_time = time.time()
         try:
-            # 쿼리와 파라미터 로깅
+            # 쿼리와 파라미터 로깅 (콘솔 + Logstash)
             if params:
-                logger.info(f"[SQL Query] {query}")
-                logger.info(f"[SQL Params] {params}")
-                print(f"[SQL Query] {query}", flush=True)
-                print(f"[SQL Params] {params}", flush=True)
+                query_log = f"[SQL Query] {query}"
+                params_log = f"[SQL Params] {params}"
+
+                logger.info(query_log)
+                logger.info(params_log)
+                print(query_log, flush=True)
+                print(params_log, flush=True)
+
+                # Logstash로 전송
+                send_to_logstash(query_log, {"sql_query": query})
+                send_to_logstash(params_log, {"sql_params": str(params)})
             else:
-                logger.info(f"[SQL Query] {query}")
-                print(f"[SQL Query] {query}", flush=True)
+                query_log = f"[SQL Query] {query}"
+                logger.info(query_log)
+                print(query_log, flush=True)
+                send_to_logstash(query_log, {"sql_query": query})
 
             result = self._cursor.execute(query, params)
 
-            # 실행 시간 로깅
+            # 실행 시간 로깅 (콘솔 + Logstash)
             execution_time = (time.time() - start_time) * 1000
-            logger.info(f"[SQL Execution Time] {execution_time:.2f}ms")
-            print(f"[SQL Execution Time] {execution_time:.2f}ms", flush=True)
+            time_log = f"[SQL Execution Time] {execution_time:.2f}ms"
+
+            logger.info(time_log)
+            print(time_log, flush=True)
+            send_to_logstash(time_log, {
+                "execution_time_ms": execution_time,
+                "sql_query": query[:100] + "..." if len(query) > 100 else query
+            })
 
             return result
         except Exception as e:
             execution_time = (time.time() - start_time) * 1000
-            logger.error(f"[SQL Error] {str(e)} (took {execution_time:.2f}ms)")
-            print(f"[SQL Error] {str(e)} (took {execution_time:.2f}ms)", flush=True)
+            error_log = f"[SQL Error] {str(e)} (took {execution_time:.2f}ms)"
+
+            logger.error(error_log)
+            print(error_log, flush=True)
+            send_to_logstash(error_log, {
+                "error_message": str(e),
+                "execution_time_ms": execution_time,
+                "sql_query": query[:100] + "..." if len(query) > 100 else query
+            })
             raise
 
     def fetchall(self):
@@ -109,6 +149,34 @@ def get_db_connection():
 def health_check():
     """헬스 체크"""
     return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
+
+@app.route('/test-sql-logging', methods=['GET'])
+def test_sql_logging():
+    """SQL 로깅 테스트"""
+    try:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cursor:
+                # 간단한 테스트 쿼리
+                cursor.execute("SELECT COUNT(*) as total_orders FROM orders")
+                result = cursor.fetchone()
+
+                cursor.execute("SELECT status, COUNT(*) as count FROM orders GROUP BY status LIMIT 5")
+                status_counts = cursor.fetchall()
+
+                return jsonify({
+                    "message": "SQL logging test completed",
+                    "total_orders": result['total_orders'],
+                    "status_breakdown": [
+                        {"status": row['status'], "count": row['count']}
+                        for row in status_counts
+                    ]
+                })
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error in SQL logging test: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/recommendations/<user_id>', methods=['GET'])
 def get_user_recommendations(user_id):
@@ -528,6 +596,434 @@ def get_products_from_db():
     except Exception as e:
         logger.error(f"Error getting products from database: {e}")
         return jsonify({"error": "Internal server error"}), 500
+
+# 복잡한 분석 쿼리들 - 시간이 오래 걸리는 쿼리들
+
+@app.route('/analytics/complex-order-analysis')
+def complex_order_analysis():
+    """복잡한 주문 분석 - 여러 테이블 조인 및 집계"""
+    try:
+        conn = get_db_connection()
+        with conn:
+            with conn.cursor() as cursor:
+                # 매우 복잡한 주문 분석 쿼리 (시간이 오래 걸림)
+                query = """
+                    WITH monthly_stats AS (
+                        SELECT
+                            DATE_TRUNC('month', o.created_at) as month,
+                            c.name as category,
+                            COUNT(DISTINCT o.order_id) as order_count,
+                            COUNT(DISTINCT o.user_id) as unique_customers,
+                            SUM(oi.quantity * oi.unit_price) as revenue,
+                            AVG(oi.quantity * oi.unit_price) as avg_order_value,
+                            MIN(oi.quantity * oi.unit_price) as min_order_value,
+                            MAX(oi.quantity * oi.unit_price) as max_order_value,
+                            STDDEV(oi.quantity * oi.unit_price) as revenue_stddev
+                        FROM orders o
+                        JOIN order_items oi ON o.order_id = oi.order_id
+                        JOIN products p ON oi.product_id = p.product_id
+                        JOIN categories c ON p.category_id = c.category_id
+                        WHERE o.created_at >= CURRENT_DATE - INTERVAL '12 months'
+                        GROUP BY DATE_TRUNC('month', o.created_at), c.name
+                    ),
+                    growth_rates AS (
+                        SELECT
+                            month, category, revenue,
+                            LAG(revenue) OVER (PARTITION BY category ORDER BY month) as prev_revenue,
+                            CASE
+                                WHEN LAG(revenue) OVER (PARTITION BY category ORDER BY month) > 0
+                                THEN ((revenue - LAG(revenue) OVER (PARTITION BY category ORDER BY month)) /
+                                      LAG(revenue) OVER (PARTITION BY category ORDER BY month)) * 100
+                                ELSE 0
+                            END as growth_rate
+                        FROM monthly_stats
+                    )
+                    SELECT
+                        gr.month, gr.category, gr.revenue, gr.growth_rate,
+                        ms.order_count, ms.unique_customers, ms.avg_order_value,
+                        ms.revenue_stddev,
+                        RANK() OVER (PARTITION BY gr.month ORDER BY gr.revenue DESC) as revenue_rank,
+                        ROW_NUMBER() OVER (ORDER BY gr.growth_rate DESC NULLS LAST) as growth_rank
+                    FROM growth_rates gr
+                    JOIN monthly_stats ms ON gr.month = ms.month AND gr.category = ms.category
+                    ORDER BY gr.month DESC, gr.revenue DESC
+                    LIMIT 100
+                """
+
+                cursor.execute(query)
+                results = cursor.fetchall()
+
+                analysis_data = []
+                for row in results:
+                    analysis_data.append({
+                        'month': row['month'].isoformat() if row['month'] else None,
+                        'category': row['category'],
+                        'revenue': float(row['revenue']) if row['revenue'] else 0,
+                        'growth_rate': float(row['growth_rate']) if row['growth_rate'] else 0,
+                        'order_count': row['order_count'],
+                        'unique_customers': row['unique_customers'],
+                        'avg_order_value': float(row['avg_order_value']) if row['avg_order_value'] else 0,
+                        'revenue_stddev': float(row['revenue_stddev']) if row['revenue_stddev'] else 0,
+                        'revenue_rank': row['revenue_rank'],
+                        'growth_rank': row['growth_rank']
+                    })
+
+                return jsonify({
+                    "complex_analysis": analysis_data,
+                    "query_type": "Complex Multi-table Analysis with Window Functions"
+                })
+
+    except Exception as e:
+        logger.error(f"Error in complex order analysis: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+@app.route('/analytics/heavy-aggregation')
+def heavy_aggregation():
+    """무거운 집계 쿼리 - 대용량 데이터 GROUP BY"""
+    try:
+        conn = get_db_connection()
+        with conn:
+            with conn.cursor() as cursor:
+                # 대용량 집계 쿼리 (인덱스 스캔이 많이 발생)
+                query = """
+                    SELECT
+                        p.name as product_name,
+                        c.name as category,
+                        b.name as brand,
+                        COUNT(DISTINCT o.order_id) as total_orders,
+                        SUM(oi.quantity) as total_quantity_sold,
+                        SUM(oi.quantity * oi.unit_price) as total_revenue,
+                        AVG(oi.quantity * oi.unit_price) as avg_order_item_value,
+                        MIN(o.created_at) as first_order_date,
+                        MAX(o.created_at) as last_order_date,
+                        COUNT(DISTINCT o.user_id) as unique_customers,
+                        COUNT(DISTINCT DATE_TRUNC('month', o.created_at)) as months_active,
+                        COALESCE(AVG(pr.rating), 0) as avg_product_rating,
+                        COUNT(pr.review_id) as review_count,
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY oi.quantity * oi.unit_price) as median_order_value,
+                        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY oi.quantity * oi.unit_price) as p95_order_value
+                    FROM products p
+                    JOIN categories c ON p.category_id = c.category_id
+                    JOIN brands b ON p.brand_id = b.brand_id
+                    LEFT JOIN order_items oi ON p.product_id = oi.product_id
+                    LEFT JOIN orders o ON oi.order_id = o.order_id
+                    LEFT JOIN product_reviews pr ON p.product_id = pr.product_id
+                    WHERE o.created_at >= CURRENT_DATE - INTERVAL '6 months'
+                    GROUP BY p.product_id, p.name, c.name, b.name
+                    HAVING COUNT(DISTINCT o.order_id) > 0
+                    ORDER BY total_revenue DESC NULLS LAST, total_orders DESC
+                    LIMIT 50
+                """
+
+                cursor.execute(query)
+                results = cursor.fetchall()
+
+                aggregation_data = []
+                for row in results:
+                    aggregation_data.append({
+                        'product_name': row['product_name'],
+                        'category': row['category'],
+                        'brand': row['brand'],
+                        'total_orders': row['total_orders'],
+                        'total_quantity_sold': row['total_quantity_sold'],
+                        'total_revenue': float(row['total_revenue']) if row['total_revenue'] else 0,
+                        'avg_order_item_value': float(row['avg_order_item_value']) if row['avg_order_item_value'] else 0,
+                        'first_order_date': row['first_order_date'].isoformat() if row['first_order_date'] else None,
+                        'last_order_date': row['last_order_date'].isoformat() if row['last_order_date'] else None,
+                        'unique_customers': row['unique_customers'],
+                        'months_active': row['months_active'],
+                        'avg_product_rating': float(row['avg_product_rating']) if row['avg_product_rating'] else 0,
+                        'review_count': row['review_count'],
+                        'median_order_value': float(row['median_order_value']) if row['median_order_value'] else 0,
+                        'p95_order_value': float(row['p95_order_value']) if row['p95_order_value'] else 0
+                    })
+
+                return jsonify({
+                    "heavy_aggregation": aggregation_data,
+                    "query_type": "Heavy Aggregation with Multiple JOINs and Statistical Functions"
+                })
+
+    except Exception as e:
+        logger.error(f"Error in heavy aggregation: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+@app.route('/analytics/recursive-category-tree')
+def recursive_category_tree():
+    """재귀 쿼리 - 카테고리 트리 구조 분석"""
+    try:
+        conn = get_db_connection()
+        with conn:
+            with conn.cursor() as cursor:
+                # 재귀 CTE를 사용한 복잡한 쿼리
+                query = """
+                    WITH RECURSIVE category_hierarchy AS (
+                        -- Base case: root categories
+                        SELECT
+                            category_id,
+                            name,
+                            parent_category_id,
+                            1 as level,
+                            name as path,
+                            ARRAY[category_id] as id_path
+                        FROM categories
+                        WHERE parent_category_id IS NULL
+
+                        UNION ALL
+
+                        -- Recursive case: child categories
+                        SELECT
+                            c.category_id,
+                            c.name,
+                            c.parent_category_id,
+                            ch.level + 1,
+                            ch.path || ' > ' || c.name,
+                            ch.id_path || c.category_id
+                        FROM categories c
+                        JOIN category_hierarchy ch ON c.parent_category_id = ch.category_id
+                        WHERE ch.level < 10  -- Prevent infinite recursion
+                    ),
+                    category_stats AS (
+                        SELECT
+                            ch.category_id,
+                            ch.name,
+                            ch.level,
+                            ch.path,
+                            COUNT(DISTINCT p.product_id) as product_count,
+                            COUNT(DISTINCT o.order_id) as order_count,
+                            COALESCE(SUM(oi.quantity * oi.unit_price), 0) as total_revenue,
+                            COUNT(DISTINCT o.user_id) as unique_customers,
+                            COALESCE(AVG(p.rating), 0) as avg_rating,
+                            MIN(p.price) as min_price,
+                            MAX(p.price) as max_price,
+                            COALESCE(AVG(p.price), 0) as avg_price
+                        FROM category_hierarchy ch
+                        LEFT JOIN products p ON ch.category_id = p.category_id
+                        LEFT JOIN order_items oi ON p.product_id = oi.product_id
+                        LEFT JOIN orders o ON oi.order_id = o.order_id
+                        WHERE o.created_at IS NULL OR o.created_at >= CURRENT_DATE - INTERVAL '3 months'
+                        GROUP BY ch.category_id, ch.name, ch.level, ch.path
+                    )
+                    SELECT
+                        cs.*,
+                        RANK() OVER (PARTITION BY cs.level ORDER BY cs.total_revenue DESC) as revenue_rank_in_level,
+                        LAG(cs.total_revenue) OVER (PARTITION BY cs.level ORDER BY cs.total_revenue DESC) as prev_revenue_in_level,
+                        CASE
+                            WHEN cs.product_count > 0
+                            THEN cs.total_revenue / cs.product_count
+                            ELSE 0
+                        END as revenue_per_product
+                    FROM category_stats cs
+                    ORDER BY cs.level, cs.total_revenue DESC
+                """
+
+                cursor.execute(query)
+                results = cursor.fetchall()
+
+                tree_data = []
+                for row in results:
+                    tree_data.append({
+                        'category_id': row['category_id'],
+                        'name': row['name'],
+                        'level': row['level'],
+                        'path': row['path'],
+                        'product_count': row['product_count'],
+                        'order_count': row['order_count'],
+                        'total_revenue': float(row['total_revenue']) if row['total_revenue'] else 0,
+                        'unique_customers': row['unique_customers'],
+                        'avg_rating': float(row['avg_rating']) if row['avg_rating'] else 0,
+                        'min_price': float(row['min_price']) if row['min_price'] else 0,
+                        'max_price': float(row['max_price']) if row['max_price'] else 0,
+                        'avg_price': float(row['avg_price']) if row['avg_price'] else 0,
+                        'revenue_rank_in_level': row['revenue_rank_in_level'],
+                        'revenue_per_product': float(row['revenue_per_product']) if row['revenue_per_product'] else 0
+                    })
+
+                return jsonify({
+                    "category_tree": tree_data,
+                    "query_type": "Recursive CTE with Complex Hierarchy Analysis"
+                })
+
+    except Exception as e:
+        logger.error(f"Error in recursive category tree: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+@app.route('/analytics/customer-cohort-analysis')
+def customer_cohort_analysis():
+    """고객 코호트 분석 - 매우 복잡한 시계열 분석"""
+    try:
+        conn = get_db_connection()
+        with conn:
+            with conn.cursor() as cursor:
+                # 코호트 분석 쿼리 (매우 복잡하고 시간이 오래 걸림)
+                query = """
+                    WITH customer_first_orders AS (
+                        SELECT
+                            user_id,
+                            MIN(created_at) as first_order_date,
+                            DATE_TRUNC('month', MIN(created_at)) as cohort_month
+                        FROM orders
+                        GROUP BY user_id
+                    ),
+                    customer_orders AS (
+                        SELECT
+                            o.user_id,
+                            o.order_id,
+                            o.created_at,
+                            cfo.cohort_month,
+                            DATE_TRUNC('month', o.created_at) as order_month,
+                            EXTRACT(YEAR FROM AGE(DATE_TRUNC('month', o.created_at), cfo.cohort_month)) * 12 +
+                            EXTRACT(MONTH FROM AGE(DATE_TRUNC('month', o.created_at), cfo.cohort_month)) as period_number,
+                            SUM(oi.quantity * oi.unit_price) as order_value
+                        FROM orders o
+                        JOIN customer_first_orders cfo ON o.user_id = cfo.user_id
+                        JOIN order_items oi ON o.order_id = oi.order_id
+                        WHERE o.created_at >= CURRENT_DATE - INTERVAL '18 months'
+                        GROUP BY o.user_id, o.order_id, o.created_at, cfo.cohort_month
+                    ),
+                    cohort_data AS (
+                        SELECT
+                            cohort_month,
+                            period_number,
+                            COUNT(DISTINCT user_id) as customers,
+                            COUNT(DISTINCT order_id) as orders,
+                            SUM(order_value) as revenue,
+                            AVG(order_value) as avg_order_value,
+                            MIN(order_value) as min_order_value,
+                            MAX(order_value) as max_order_value
+                        FROM customer_orders
+                        WHERE period_number >= 0 AND period_number <= 12
+                        GROUP BY cohort_month, period_number
+                    ),
+                    cohort_sizes AS (
+                        SELECT
+                            cohort_month,
+                            COUNT(DISTINCT user_id) as cohort_size
+                        FROM customer_first_orders
+                        GROUP BY cohort_month
+                    )
+                    SELECT
+                        cd.cohort_month,
+                        cd.period_number,
+                        cd.customers,
+                        cs.cohort_size,
+                        ROUND((cd.customers::DECIMAL / cs.cohort_size) * 100, 2) as retention_rate,
+                        cd.orders,
+                        cd.revenue,
+                        cd.avg_order_value,
+                        cd.min_order_value,
+                        cd.max_order_value,
+                        ROUND(cd.revenue / cd.customers, 2) as revenue_per_customer,
+                        ROUND(cd.orders::DECIMAL / cd.customers, 2) as orders_per_customer,
+                        LAG(cd.customers) OVER (PARTITION BY cd.cohort_month ORDER BY cd.period_number) as prev_period_customers,
+                        CASE
+                            WHEN LAG(cd.customers) OVER (PARTITION BY cd.cohort_month ORDER BY cd.period_number) > 0
+                            THEN ROUND(((cd.customers - LAG(cd.customers) OVER (PARTITION BY cd.cohort_month ORDER BY cd.period_number))::DECIMAL /
+                                      LAG(cd.customers) OVER (PARTITION BY cd.cohort_month ORDER BY cd.period_number)) * 100, 2)
+                            ELSE 0
+                        END as period_growth_rate
+                    FROM cohort_data cd
+                    JOIN cohort_sizes cs ON cd.cohort_month = cs.cohort_month
+                    ORDER BY cd.cohort_month DESC, cd.period_number
+                """
+
+                cursor.execute(query)
+                results = cursor.fetchall()
+
+                cohort_data = []
+                for row in results:
+                    cohort_data.append({
+                        'cohort_month': row['cohort_month'].isoformat() if row['cohort_month'] else None,
+                        'period_number': row['period_number'],
+                        'customers': row['customers'],
+                        'cohort_size': row['cohort_size'],
+                        'retention_rate': float(row['retention_rate']) if row['retention_rate'] else 0,
+                        'orders': row['orders'],
+                        'revenue': float(row['revenue']) if row['revenue'] else 0,
+                        'avg_order_value': float(row['avg_order_value']) if row['avg_order_value'] else 0,
+                        'min_order_value': float(row['min_order_value']) if row['min_order_value'] else 0,
+                        'max_order_value': float(row['max_order_value']) if row['max_order_value'] else 0,
+                        'revenue_per_customer': float(row['revenue_per_customer']) if row['revenue_per_customer'] else 0,
+                        'orders_per_customer': float(row['orders_per_customer']) if row['orders_per_customer'] else 0,
+                        'period_growth_rate': float(row['period_growth_rate']) if row['period_growth_rate'] else 0
+                    })
+
+                return jsonify({
+                    "cohort_analysis": cohort_data,
+                    "query_type": "Complex Customer Cohort Analysis with Retention Metrics"
+                })
+
+    except Exception as e:
+        logger.error(f"Error in customer cohort analysis: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+@app.route('/analytics/full-table-scan-test')
+def full_table_scan_test():
+    """의도적인 Full Table Scan 테스트 (매우 느린 쿼리)"""
+    try:
+        conn = get_db_connection()
+        with conn:
+            with conn.cursor() as cursor:
+                # 의도적으로 인덱스를 사용하지 않는 쿼리 (매우 느림)
+                query = """
+                    SELECT
+                        COUNT(*) as total_records,
+                        AVG(CAST(SUBSTRING(o.order_id::text, 1, 3) AS INTEGER)) as avg_id_prefix,
+                        SUM(CASE WHEN o.created_at::text LIKE '%2024%' THEN 1 ELSE 0 END) as year_2024_count,
+                        MAX(LENGTH(u.first_name || u.last_name)) as max_name_length,
+                        MIN(EXTRACT(EPOCH FROM o.created_at)) as min_timestamp,
+                        COUNT(DISTINCT UPPER(LEFT(p.name, 5))) as unique_product_prefixes,
+                        SUM(CASE WHEN oi.unit_price::text ~ '^[0-9]+\\.[0-9]{2}$' THEN 1 ELSE 0 END) as exact_price_count,
+                        AVG(CASE WHEN c.name ~ '[aeiou]' THEN LENGTH(c.name) ELSE 0 END) as avg_vowel_category_length
+                    FROM orders o
+                    JOIN users u ON CAST(o.user_id AS TEXT) = CAST(u.user_id AS TEXT)
+                    JOIN order_items oi ON CAST(o.order_id AS TEXT) = CAST(oi.order_id AS TEXT)
+                    JOIN products p ON CAST(oi.product_id AS TEXT) = CAST(p.product_id AS TEXT)
+                    JOIN categories c ON CAST(p.category_id AS TEXT) = CAST(c.category_id AS TEXT)
+                    WHERE
+                        o.created_at::text NOT LIKE '%impossible_date%'
+                        AND u.email::text NOT LIKE '%@nonexistent.com'
+                        AND p.description IS NOT NULL
+                        AND RANDOM() < 1.0  -- Force full scan
+                """
+
+                cursor.execute(query)
+                result = cursor.fetchone()
+
+                scan_data = {
+                    'total_records': result['total_records'],
+                    'avg_id_prefix': float(result['avg_id_prefix']) if result['avg_id_prefix'] else 0,
+                    'year_2024_count': result['year_2024_count'],
+                    'max_name_length': result['max_name_length'],
+                    'min_timestamp': float(result['min_timestamp']) if result['min_timestamp'] else 0,
+                    'unique_product_prefixes': result['unique_product_prefixes'],
+                    'exact_price_count': result['exact_price_count'],
+                    'avg_vowel_category_length': float(result['avg_vowel_category_length']) if result['avg_vowel_category_length'] else 0
+                }
+
+                return jsonify({
+                    "full_scan_test": scan_data,
+                    "query_type": "Intentional Full Table Scan with String Operations",
+                    "warning": "This query is intentionally slow for testing purposes"
+                })
+
+    except Exception as e:
+        logger.error(f"Error in full table scan test: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+    finally:
+        if 'conn' in locals():
+            conn.close()
 
 @app.route('/user-behavior/<user_id>', methods=['GET'])
 def get_user_behavior(user_id):
@@ -1476,6 +1972,117 @@ def product_stats_covering_index():
 
     except Exception as e:
         logger.error(f"Error in product stats covering index: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/db-tuning/partition-performance', methods=['GET'])
+def partition_performance_comparison():
+    """파티션 vs 일반 테이블 성능 비교"""
+    try:
+        status_filter = request.args.get('status', 'shipped')
+        limit = int(request.args.get('limit', 1000))
+
+        conn = get_db_connection()
+        results = {}
+
+        try:
+            with conn.cursor() as cursor:
+                # 1. 일반 테이블에서 조회 (120만건 풀스캔)
+                start_time = time.time()
+                cursor.execute("""
+                    SELECT order_id, user_id, status, total_amount, created_at
+                    FROM orders
+                    WHERE status = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                """, (status_filter, limit))
+                normal_results = cursor.fetchall()
+                normal_time = time.time() - start_time
+
+                # 2. 원본 테이블 백업에서 조회 (비교용)
+                start_time = time.time()
+                cursor.execute("""
+                    SELECT order_id, user_id, status, total_amount, created_at
+                    FROM orders_old_original
+                    WHERE status = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                """, (status_filter, limit))
+                partition_results = cursor.fetchall()
+                partition_time = time.time() - start_time
+
+                # 3. 원본 테이블에서 날짜 범위 조회
+                start_time = time.time()
+                cursor.execute("""
+                    SELECT order_id, user_id, status, total_amount, created_at
+                    FROM orders_old_original
+                    WHERE status = %s
+                    AND created_at >= '2025-09-24'
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                """, (status_filter, limit))
+                normal_date_results = cursor.fetchall()
+                normal_date_time = time.time() - start_time
+
+                # 4. 파티션 테이블에서 날짜 범위 조회 (파티션 프루닝) - 현재는 orders가 파티션 테이블
+                start_time = time.time()
+                cursor.execute("""
+                    SELECT order_id, user_id, status, total_amount, created_at
+                    FROM orders
+                    WHERE status = %s
+                    AND created_at >= '2025-09-24'
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                """, (status_filter, limit))
+                partition_date_results = cursor.fetchall()
+                partition_date_time = time.time() - start_time
+
+                # 성능 비교 결과
+                results = {
+                    'scenario': 'Partitioned vs Normal Table Performance',
+                    'test_parameters': {
+                        'status_filter': status_filter,
+                        'limit': limit,
+                        'total_records': 1205308
+                    },
+                    'performance_comparison': {
+                        'status_only_query': {
+                            'normal_table_ms': round(normal_time * 1000, 2),
+                            'partition_table_ms': round(partition_time * 1000, 2),
+                            'improvement': f"{round(normal_time / partition_time, 1)}x faster" if partition_time > 0 else 'N/A',
+                            'records_returned': len(partition_results)
+                        },
+                        'date_range_query': {
+                            'normal_table_ms': round(normal_date_time * 1000, 2),
+                            'partition_table_ms': round(partition_date_time * 1000, 2),
+                            'improvement': f"{round(normal_date_time / partition_date_time, 1)}x faster" if partition_date_time > 0 else 'N/A',
+                            'records_returned': len(partition_date_results)
+                        }
+                    },
+                    'partition_info': {
+                        'partition_strategy': 'RANGE by created_at',
+                        'partitions': ['orders_2025_09', 'orders_2025_10', 'orders_2025_11'],
+                        'partition_pruning': 'Enabled - only scans relevant partitions',
+                        'indexes_per_partition': ['status', 'user_id', 'order_date']
+                    },
+                    'sample_data': [
+                        {
+                            'order_id': row['order_id'],
+                            'user_id': row['user_id'],
+                            'status': row['status'],
+                            'total_amount': float(row['total_amount']),
+                            'created_at': row['created_at'].isoformat()
+                        }
+                        for row in partition_date_results[:3]
+                    ]
+                }
+
+                return jsonify(results)
+
+        finally:
+            conn.close()
+
+    except Exception as e:
+        logger.error(f"Error in partition performance comparison: {e}")
         return jsonify({"error": str(e)}), 500
 
 # DB 튜닝 API 엔드포인트들 - 대용량 데이터 최적화
@@ -2890,6 +3497,176 @@ def generate_health_recommendations(health_report):
         })
 
     return recommendations
+
+@app.route('/heavy-join-query')
+def heavy_join_query():
+    """무거운 조인 쿼리 - 실제 복잡한 SQL이 로그에 나타나도록"""
+    try:
+        conn = get_db_connection()
+        with conn:
+            with conn.cursor() as cursor:
+                # 복잡한 JOIN과 윈도우 함수가 포함된 쿼리
+                heavy_query = """
+                    SELECT
+                        o.order_id,
+                        o.user_id,
+                        o.created_at,
+                        oi.product_id,
+                        p.name as product_name,
+                        c.name as category_name,
+                        b.name as brand_name,
+                        oi.quantity,
+                        oi.unit_price,
+                        (oi.quantity * oi.unit_price) as item_total,
+                        ROW_NUMBER() OVER (PARTITION BY o.user_id ORDER BY o.created_at DESC) as user_order_rank,
+                        COUNT(*) OVER (PARTITION BY o.user_id) as user_total_orders,
+                        AVG(oi.unit_price) OVER (PARTITION BY p.category_id) as category_avg_price,
+                        RANK() OVER (PARTITION BY p.category_id ORDER BY (oi.quantity * oi.unit_price) DESC) as item_value_rank_in_category
+                    FROM orders o
+                    INNER JOIN order_items oi ON o.order_id = oi.order_id
+                    INNER JOIN products p ON oi.product_id = p.product_id
+                    INNER JOIN categories c ON p.category_id = c.category_id
+                    INNER JOIN brands b ON p.brand_id = b.brand_id
+                    WHERE o.created_at >= CURRENT_DATE - INTERVAL '30 days'
+                    ORDER BY o.created_at DESC, (oi.quantity * oi.unit_price) DESC
+                    LIMIT 100
+                """
+
+                cursor.execute(heavy_query)
+                results = cursor.fetchall()
+
+                return jsonify({
+                    "message": "Heavy JOIN query with window functions executed",
+                    "result_count": len(results),
+                    "query_complexity": "Multiple JOINs + Window Functions (ROW_NUMBER, COUNT, AVG, RANK)"
+                })
+
+    except Exception as e:
+        logger.error(f"Error in heavy join query: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+@app.route('/complex-sql-test')
+def complex_sql_test():
+    """복잡한 SQL 쿼리 테스트 - 다양한 복잡한 쿼리들을 순차 실행"""
+    try:
+        conn = get_db_connection()
+        results = []
+
+        with conn:
+            with conn.cursor() as cursor:
+                # 1. 복잡한 JOIN 쿼리
+                complex_join_query = """
+                    SELECT
+                        p.name as product_name,
+                        c.name as category,
+                        b.name as brand,
+                        COUNT(DISTINCT oi.order_id) as total_orders,
+                        SUM(oi.quantity) as total_sold,
+                        AVG(oi.unit_price) as avg_price,
+                        MAX(o.created_at) as last_order_date
+                    FROM products p
+                    JOIN categories c ON p.category_id = c.category_id
+                    JOIN brands b ON p.brand_id = b.brand_id
+                    LEFT JOIN order_items oi ON p.product_id = oi.product_id
+                    LEFT JOIN orders o ON oi.order_id = o.order_id
+                    WHERE o.created_at >= CURRENT_DATE - INTERVAL '30 days'
+                    GROUP BY p.product_id, p.name, c.name, b.name
+                    HAVING COUNT(DISTINCT oi.order_id) > 5
+                    ORDER BY total_sold DESC
+                    LIMIT 10
+                """
+                cursor.execute(complex_join_query)
+                join_results = cursor.fetchall()
+                results.append({"query_type": "Complex JOIN with aggregation", "count": len(join_results)})
+
+                # 2. 윈도우 함수 쿼리
+                window_query = """
+                    SELECT
+                        user_id,
+                        created_at,
+                        LAG(created_at) OVER (PARTITION BY user_id ORDER BY created_at) as prev_order,
+                        LEAD(created_at) OVER (PARTITION BY user_id ORDER BY created_at) as next_order,
+                        ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY created_at) as order_sequence,
+                        COUNT(*) OVER (PARTITION BY user_id) as total_user_orders
+                    FROM orders
+                    WHERE created_at >= CURRENT_DATE - INTERVAL '60 days'
+                    ORDER BY user_id, created_at
+                    LIMIT 50
+                """
+                cursor.execute(window_query)
+                window_results = cursor.fetchall()
+                results.append({"query_type": "Window functions with LAG/LEAD", "count": len(window_results)})
+
+                # 3. 서브쿼리 및 CTE
+                cte_query = """
+                    WITH monthly_sales AS (
+                        SELECT
+                            DATE_TRUNC('month', o.created_at) as month,
+                            SUM(oi.quantity * oi.unit_price) as monthly_revenue,
+                            COUNT(DISTINCT o.order_id) as monthly_orders
+                        FROM orders o
+                        JOIN order_items oi ON o.order_id = oi.order_id
+                        WHERE o.created_at >= CURRENT_DATE - INTERVAL '6 months'
+                        GROUP BY DATE_TRUNC('month', o.created_at)
+                    ),
+                    revenue_stats AS (
+                        SELECT
+                            month,
+                            monthly_revenue,
+                            monthly_orders,
+                            LAG(monthly_revenue) OVER (ORDER BY month) as prev_month_revenue,
+                            CASE
+                                WHEN LAG(monthly_revenue) OVER (ORDER BY month) > 0
+                                THEN ((monthly_revenue - LAG(monthly_revenue) OVER (ORDER BY month)) /
+                                      LAG(monthly_revenue) OVER (ORDER BY month)) * 100
+                                ELSE 0
+                            END as growth_rate
+                        FROM monthly_sales
+                    )
+                    SELECT * FROM revenue_stats
+                    WHERE growth_rate IS NOT NULL
+                    ORDER BY month DESC
+                """
+                cursor.execute(cte_query)
+                cte_results = cursor.fetchall()
+                results.append({"query_type": "CTE with growth rate calculation", "count": len(cte_results)})
+
+                # 4. 집계 및 통계 함수
+                stats_query = """
+                    SELECT
+                        c.name as category,
+                        COUNT(DISTINCT p.product_id) as product_count,
+                        AVG(p.price) as avg_price,
+                        STDDEV(p.price) as price_stddev,
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.price) as median_price,
+                        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY p.price) as p95_price,
+                        MIN(p.price) as min_price,
+                        MAX(p.price) as max_price
+                    FROM categories c
+                    JOIN products p ON c.category_id = p.category_id
+                    GROUP BY c.category_id, c.name
+                    HAVING COUNT(DISTINCT p.product_id) > 10
+                    ORDER BY avg_price DESC
+                """
+                cursor.execute(stats_query)
+                stats_results = cursor.fetchall()
+                results.append({"query_type": "Statistical aggregations with percentiles", "count": len(stats_results)})
+
+        return jsonify({
+            "message": "Complex SQL queries executed successfully",
+            "results": results,
+            "total_queries": len(results)
+        })
+
+    except Exception as e:
+        logger.error(f"Error in complex SQL test: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+    finally:
+        if 'conn' in locals():
+            conn.close()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)

@@ -98,6 +98,24 @@ services:
     networks:
       - ecommerce-net
 
+  # Logstash for SQL log processing
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.8.0
+    hostname: logstash
+    container_name: logstash
+    depends_on:
+      - elasticsearch
+    ports:
+      - "5044:5044"
+      - "9600:9600"
+    volumes:
+      - ./logstash/config:/usr/share/logstash/config
+      - ./logstash/pipeline:/usr/share/logstash/pipeline
+    environment:
+      LS_JAVA_OPTS: "-Xmx256m -Xms256m"
+    networks:
+      - ecommerce-net
+
   # Kafka UI for Kafka visualization
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
@@ -215,10 +233,89 @@ services:
     networks:
       - ecommerce-net
 
+  # Airflow (Scheduler, Webserver, Database)
+  airflow-postgres:
+    image: postgres:13
+    hostname: airflow-postgres
+    container_name: airflow-postgres
+    environment:
+      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+    volumes:
+      - airflow-postgres-data:/var/lib/postgresql/data
+    networks:
+      - ecommerce-net
+
+  airflow-init:
+    image: apache/airflow:2.7.0-python3.9
+    container_name: airflow-init
+    depends_on:
+      - airflow-postgres
+    environment:
+      _AIRFLOW_DB_UPGRADE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+    command: |
+      bash -c "
+        airflow db init &&
+        airflow users create --username admin --password admin --firstname Admin --lastname Admin --role Admin --email admin@example.com
+      "
+    networks:
+      - ecommerce-net
+
+  airflow-webserver:
+    image: apache/airflow:2.7.0-python3.9
+    hostname: airflow-webserver
+    container_name: airflow-webserver
+    depends_on:
+      - airflow-init
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+    ports:
+      - "8081:8080"
+    command: airflow webserver
+    networks:
+      - ecommerce-net
+
+  airflow-scheduler:
+    image: apache/airflow:2.7.0-python3.9
+    hostname: airflow-scheduler
+    container_name: airflow-scheduler
+    depends_on:
+      - airflow-init
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+    command: airflow scheduler
+    networks:
+      - ecommerce-net
+
 volumes:
   redis-data:
   es-data:
   postgres-data:
+  airflow-postgres-data:
 
 networks:
   ecommerce-net:
