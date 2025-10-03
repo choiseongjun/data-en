@@ -5,6 +5,8 @@ import json
 import logging
 from datetime import datetime
 import time
+import pandas as pd
+import os
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
@@ -27,6 +29,10 @@ class OrdersETL:
 
         # 마지막 ETL 실행 시간 추적
         self.last_etl_time = None
+
+        # S3-like 로컬 스토리지 경로 설정
+        self.storage_path = '/data/s3-storage/orders'
+        os.makedirs(self.storage_path, exist_ok=True)
 
     def close_connection(self):
         """PostgreSQL 연결 정리"""
@@ -261,6 +267,90 @@ class OrdersETL:
 
         logger.info(f"Total indexed: {total_indexed} out of {len(orders)} orders")
 
+    def load_to_file_storage(self, orders):
+        """S3-like 로컬 스토리지에 Parquet 파일로 저장 (시간 단위 병합)"""
+        try:
+            if not orders:
+                logger.info("No orders to save to file storage")
+                return None
+
+            # 현재 날짜/시간 기반 파티셔닝 (year=YYYY/month=MM/day=DD)
+            now = datetime.now()
+            partition_path = os.path.join(
+                self.storage_path,
+                f"year={now.year}",
+                f"month={now.month:02d}",
+                f"day={now.day:02d}"
+            )
+            os.makedirs(partition_path, exist_ok=True)
+
+            # 시간 단위 파일명 (같은 시간대 데이터는 하나의 파일로 병합)
+            hour_timestamp = now.strftime("%Y%m%d_%H")  # 시간 단위
+            file_path = os.path.join(partition_path, f"orders_{hour_timestamp}.parquet")
+            json_file_path = os.path.join(partition_path, f"orders_{hour_timestamp}.json")
+
+            # 새로운 데이터를 DataFrame으로 변환
+            new_df = pd.DataFrame(orders)
+
+            # items 컬럼은 JSON 문자열로 변환
+            new_df['items'] = new_df['items'].apply(json.dumps)
+            new_df['categories'] = new_df['categories'].apply(json.dumps)
+            new_df['brands'] = new_df['brands'].apply(json.dumps)
+
+            # 기존 파일이 있으면 읽어서 병합
+            if os.path.exists(file_path):
+                try:
+                    existing_df = pd.read_parquet(file_path, engine='pyarrow')
+
+                    # 중복 제거: order_id 기준으로 최신 데이터 유지
+                    combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+                    combined_df = combined_df.drop_duplicates(subset=['order_id'], keep='last')
+
+                    logger.info(f"Merged {len(new_df)} new orders with {len(existing_df)} existing orders")
+                    df_to_save = combined_df
+                except Exception as e:
+                    logger.warning(f"Could not read existing file, creating new: {e}")
+                    df_to_save = new_df
+            else:
+                logger.info(f"Creating new file for hour {hour_timestamp}")
+                df_to_save = new_df
+
+            # Parquet 파일로 저장 (압축 사용)
+            df_to_save.to_parquet(file_path, engine='pyarrow', compression='snappy', index=False)
+
+            file_size = os.path.getsize(file_path) / 1024 / 1024  # MB
+            logger.info(f"Saved {len(df_to_save)} total orders to {file_path} ({file_size:.2f} MB)")
+
+            # JSON 파일도 병합하여 저장
+            if os.path.exists(json_file_path):
+                try:
+                    with open(json_file_path, 'r', encoding='utf-8') as f:
+                        existing_orders = json.load(f)
+
+                    # order_id 기준으로 중복 제거하며 병합
+                    order_dict = {order['order_id']: order for order in existing_orders}
+                    for order in orders:
+                        order_dict[order['order_id']] = order
+
+                    merged_orders = list(order_dict.values())
+                except Exception as e:
+                    logger.warning(f"Could not merge JSON, using new data: {e}")
+                    merged_orders = orders
+            else:
+                merged_orders = orders
+
+            with open(json_file_path, 'w', encoding='utf-8') as f:
+                json.dump(merged_orders, f, ensure_ascii=False, indent=2)
+
+            json_file_size = os.path.getsize(json_file_path) / 1024 / 1024  # MB
+            logger.info(f"Saved {len(merged_orders)} total orders to JSON backup ({json_file_size:.2f} MB)")
+
+            return file_path
+
+        except Exception as e:
+            logger.error(f"Failed to save to file storage: {e}")
+            raise
+
     def run_etl(self):
         """전체 ETL 프로세스 실행"""
         logger.info("Starting Orders ETL process...")
@@ -276,8 +366,11 @@ class OrdersETL:
             # Transform
             transformed_orders = self.transform_orders(orders)
 
-            # Load
+            # Load to Elasticsearch
             self.load_to_elasticsearch(transformed_orders)
+
+            # Load to File Storage (S3-like)
+            self.load_to_file_storage(transformed_orders)
 
             # 성공 시 마지막 ETL 시간 업데이트
             self.last_etl_time = datetime.now()
@@ -291,14 +384,14 @@ class OrdersETL:
                 self.close_connection()
 
 if __name__ == "__main__":
-    # 주기적으로 ETL 실행 (2분마다)
+    # 주기적으로 ETL 실행 (30초마다)
     etl = OrdersETL()
 
     while True:
         try:
             etl.run_etl()
-            logger.info("Waiting 2 minutes before next ETL run...")
-            time.sleep(120)  # 2분 대기 (더 자주 동기화)
+            logger.info("Waiting 30 seconds before next ETL run...")
+            time.sleep(30)  # 30초 대기 (파일 저장 빈도 증가)
         except KeyboardInterrupt:
             logger.info("ETL process stopped")
             # 연결 정리
@@ -306,4 +399,4 @@ if __name__ == "__main__":
             break
         except Exception as e:
             logger.error(f"Unexpected error: {e}")
-            time.sleep(30)  # 에러 시 30초 대기
+            time.sleep(10)  # 에러 시 10초 대기

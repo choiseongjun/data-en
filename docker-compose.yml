@@ -230,6 +230,8 @@ services:
     environment:
       - POSTGRES_HOST=postgres
       - ELASTICSEARCH_HOST=elasticsearch:9200
+    volumes:
+      - ./data:/data
     networks:
       - ecommerce-net
 
